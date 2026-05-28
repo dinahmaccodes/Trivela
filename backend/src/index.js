@@ -19,6 +19,7 @@ import { resolveStellarNetworkConfig } from './config/stellarNetwork.js';
 import { validateBackendEnv } from './config/envValidation.js';
 import { createDal } from './dal/index.js';
 import { createJobRunner } from './jobs/jobRunner.js';
+import { WebhookService, WEBHOOK_EVENTS } from './services/webhookService.js';
 import {
   campaignCreateSchema,
   campaignUpdateSchema,
@@ -172,6 +173,12 @@ export async function createApp(options = {}) {
   });
   const campaignRepository = dal.campaigns;
   const auditLogRepository = dal.auditLogs;
+  const webhookRepository = dal.webhooks;
+  const referralRepository = dal.referrals;
+  const webhookService = new WebhookService(webhookRepository, {
+    fetchImpl,
+    logger: log,
+  });
   const shortCacheTtlMs = normalizePositiveInteger(
     /** @type {any} */ (options.shortCacheTtlMs) ?? process.env.SHORT_CACHE_TTL_MS,
     DEFAULT_SHORT_CACHE_TTL_MS,
@@ -280,6 +287,9 @@ export async function createApp(options = {}) {
         rpcHealthCache.payload = rpc;
         rpcHealthCache.updatedAt = new Date().toISOString();
       },
+      async webhook_retry_failed_deliveries() {
+        await webhookService.retryFailedDeliveries();
+      },
     },
     logger: log,
   });
@@ -287,6 +297,13 @@ export async function createApp(options = {}) {
   if (!options.disableJobs && rpcPollIntervalMs > 0) {
     jobRunner.enqueue('rpc_health_poll', null);
     setInterval(() => jobRunner.enqueue('rpc_health_poll', null), rpcPollIntervalMs).unref?.();
+  }
+
+  // Enqueue webhook retry job every 5 minutes (Issue #352)
+  if (!options.disableJobs) {
+    const webhookRetryIntervalMs = 5 * 60 * 1000; // 5 minutes
+    jobRunner.enqueue('webhook_retry_failed_deliveries', null);
+    setInterval(() => jobRunner.enqueue('webhook_retry_failed_deliveries', null), webhookRetryIntervalMs).unref?.();
   }
 
   async function buildHealthPayload() {
@@ -501,7 +518,7 @@ export async function createApp(options = {}) {
       });
     }
 
-    const { name, slug, description, rewardPerAction, startDate, endDate, featured, hidden, hiddenReason, active, contractId } = result.data;
+    const { name, slug, description, rewardPerAction, referralBonusPoints, startDate, endDate, featured, hidden, hiddenReason, active } = result.data;
     try {
       const campaign = campaignRepository.create({
         name,
@@ -512,6 +529,7 @@ export async function createApp(options = {}) {
         hidden: hidden ?? false,
         hiddenReason: hiddenReason ?? null,
         rewardPerAction: rewardPerAction ?? 0,
+        referralBonusPoints: referralBonusPoints ?? 0,
         startDate: startDate ?? null,
         endDate: endDate ?? null,
         contractId: contractId ?? null,
@@ -521,6 +539,16 @@ export async function createApp(options = {}) {
         entity: 'campaign',
         entityId: campaign.id,
         diff: { after: campaign },
+      });
+
+      // Dispatch webhook event (Issue #287)
+      webhookService.dispatchEvent({
+        type: WEBHOOK_EVENTS.CAMPAIGN_CREATED,
+        campaignId: campaign.id,
+        data: campaign,
+        timestamp: new Date().toISOString(),
+      }).catch((err) => {
+        log.warn({ err, campaignId: campaign.id }, 'Failed to dispatch campaign.created webhook');
       });
 
       shortCache.clear();
@@ -548,7 +576,7 @@ export async function createApp(options = {}) {
       });
     }
 
-    const { name, description, active, rewardPerAction, startDate, endDate, featured, hidden, hiddenReason, contractId } = result.data;
+    const { name, description, active, rewardPerAction, referralBonusPoints, startDate, endDate, featured, hidden, hiddenReason } = result.data;
     /** @type {Record<string, unknown>} */
     const updateFields = {};
     if (name !== undefined) updateFields.name = name;
@@ -556,6 +584,7 @@ export async function createApp(options = {}) {
     if (active !== undefined) updateFields.active = active;
     if (featured !== undefined) updateFields.featured = featured;
     if (rewardPerAction !== undefined) updateFields.rewardPerAction = rewardPerAction;
+    if (referralBonusPoints !== undefined) updateFields.referralBonusPoints = referralBonusPoints;
     if (startDate !== undefined) updateFields.startDate = startDate;
     if (endDate !== undefined) updateFields.endDate = endDate;
     if (hidden !== undefined) updateFields.hidden = hidden;
@@ -578,6 +607,34 @@ export async function createApp(options = {}) {
       entityId: campaign.id,
       diff: { before, after: campaign, changes },
     });
+
+    // Dispatch webhook events (Issue #290, #352)
+    const wasActive = before.active;
+    const isNowActive = campaign.active;
+    
+    if (active !== undefined && wasActive !== isNowActive) {
+      // Dispatch activation/deactivation event
+      const eventType = isNowActive ? WEBHOOK_EVENTS.CAMPAIGN_ACTIVATED : WEBHOOK_EVENTS.CAMPAIGN_DEACTIVATED;
+      webhookService.dispatchEvent({
+        type: eventType,
+        campaignId: campaign.id,
+        data: campaign,
+        timestamp: new Date().toISOString(),
+      }).catch((err) => {
+        log.warn({ err, campaignId: campaign.id, eventType }, 'Failed to dispatch campaign activation/deactivation webhook');
+      });
+    } else {
+      // Dispatch generic update event
+      webhookService.dispatchEvent({
+        type: WEBHOOK_EVENTS.CAMPAIGN_UPDATED,
+        campaignId: campaign.id,
+        data: campaign,
+        timestamp: new Date().toISOString(),
+      }).catch((err) => {
+        log.warn({ err, campaignId: campaign.id }, 'Failed to dispatch campaign.updated webhook');
+      });
+    }
+
     shortCache.clear();
     return res.json(campaign);
   }
@@ -595,6 +652,19 @@ export async function createApp(options = {}) {
       entityId: req.params.id,
       diff: before ? { before } : null,
     });
+
+    // Dispatch webhook event (Issue #285)
+    if (before) {
+      webhookService.dispatchEvent({
+        type: WEBHOOK_EVENTS.CAMPAIGN_DELETED,
+        campaignId: req.params.id,
+        data: before,
+        timestamp: new Date().toISOString(),
+      }).catch((err) => {
+        log.warn({ err, campaignId: req.params.id }, 'Failed to dispatch campaign.deleted webhook');
+      });
+    }
+
     shortCache.clear();
     return res.status(204).end();
   }
@@ -655,6 +725,135 @@ export async function createApp(options = {}) {
     app.post(`${prefix}/campaigns`, rateLimiter, requireApiKey, createCampaign);
     app.put(`${prefix}/campaigns/:id`, rateLimiter, requireApiKey, updateCampaign);
     app.delete(`${prefix}/campaigns/:id`, rateLimiter, requireApiKey, deleteCampaign);
+
+    // Webhook routes (Issue #287)
+    app.post(`${prefix}/webhooks`, rateLimiter, requireApiKey, (req, res) => {
+      const { url, events, secret } = req.body;
+      if (!url || !Array.isArray(events) || events.length === 0) {
+        return res.status(400).json({
+          error: 'Invalid webhook payload',
+          code: 'VALIDATION_ERROR',
+          details: ['url and events array are required'],
+        });
+      }
+      const webhook = webhookRepository.create({ url, events, secret });
+      recordAuditEntry(req, {
+        action: 'create',
+        entity: 'webhook',
+        entityId: webhook.id,
+        diff: { after: webhook },
+      });
+      return res.status(201).json(webhook);
+    });
+
+    app.get(`${prefix}/webhooks`, rateLimiter, requireApiKey, (req, res) => {
+      const webhooks = webhookRepository.list();
+      return res.json(paginateItems(webhooks, req.query));
+    });
+
+    app.get(`${prefix}/webhooks/:id`, rateLimiter, requireApiKey, (req, res) => {
+      const webhook = webhookRepository.getById(req.params.id);
+      if (!webhook) {
+        return res.status(404).json({ error: 'Webhook not found', code: 'WEBHOOK_NOT_FOUND' });
+      }
+      return res.json(webhook);
+    });
+
+    app.put(`${prefix}/webhooks/:id`, rateLimiter, requireApiKey, (req, res) => {
+      const { url, events, active } = req.body;
+      const before = webhookRepository.getById(req.params.id);
+      if (!before) {
+        return res.status(404).json({ error: 'Webhook not found', code: 'WEBHOOK_NOT_FOUND' });
+      }
+      const updates = {};
+      if (url !== undefined) updates.url = url;
+      if (events !== undefined) updates.events = events;
+      if (active !== undefined) updates.active = active;
+      const webhook = webhookRepository.update(req.params.id, updates);
+      recordAuditEntry(req, {
+        action: 'update',
+        entity: 'webhook',
+        entityId: webhook.id,
+        diff: { before, after: webhook },
+      });
+      return res.json(webhook);
+    });
+
+    app.delete(`${prefix}/webhooks/:id`, rateLimiter, requireApiKey, (req, res) => {
+      const before = webhookRepository.getById(req.params.id);
+      const deleted = webhookRepository.delete(req.params.id);
+      if (!deleted) {
+        return res.status(404).json({ error: 'Webhook not found', code: 'WEBHOOK_NOT_FOUND' });
+      }
+      recordAuditEntry(req, {
+        action: 'delete',
+        entity: 'webhook',
+        entityId: req.params.id,
+        diff: before ? { before } : null,
+      });
+      return res.status(204).end();
+    });
+
+    app.get(`${prefix}/webhooks/:id/deliveries`, rateLimiter, requireApiKey, (req, res) => {
+      const webhook = webhookRepository.getById(req.params.id);
+      if (!webhook) {
+        return res.status(404).json({ error: 'Webhook not found', code: 'WEBHOOK_NOT_FOUND' });
+      }
+      const deliveries = webhookRepository.listDeliveries(req.params.id, {
+        limit: parseInt(req.query.limit) || 100,
+      });
+      return res.json(paginateItems(deliveries, req.query));
+    });
+
+    // Referral routes (Issue #350)
+    app.post(`${prefix}/campaigns/:id/referrals`, rateLimiter, (req, res) => {
+      const campaign = campaignRepository.getById(req.params.id);
+      if (!campaign) {
+        return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+      }
+
+      const { referrerAddress, refereeAddress } = req.body ?? {};
+      if (!referrerAddress || typeof referrerAddress !== 'string') {
+        return res.status(400).json({ error: 'referrerAddress is required', code: 'VALIDATION_ERROR' });
+      }
+      if (!refereeAddress || typeof refereeAddress !== 'string') {
+        return res.status(400).json({ error: 'refereeAddress is required', code: 'VALIDATION_ERROR' });
+      }
+      if (referrerAddress === refereeAddress) {
+        return res.status(400).json({ error: 'referrerAddress and refereeAddress must be different', code: 'VALIDATION_ERROR' });
+      }
+
+      const referral = referralRepository.create({
+        campaignId: req.params.id,
+        referrerAddress: referrerAddress.trim(),
+        refereeAddress: refereeAddress.trim(),
+      });
+
+      if (!referral) {
+        return res.status(409).json({ error: 'Referee already attributed to a referrer for this campaign', code: 'REFERRAL_DUPLICATE' });
+      }
+
+      return res.status(201).json(referral);
+    });
+
+    app.get(`${prefix}/campaigns/:id/referrals/:walletAddress`, rateLimiter, (req, res) => {
+      const campaign = campaignRepository.getById(req.params.id);
+      if (!campaign) {
+        return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+      }
+
+      const walletAddress = req.params.walletAddress.trim();
+      const referralCount = referralRepository.countByReferrer(req.params.id, walletAddress);
+      const bonusEarned = referralCount * (campaign.referralBonusPoints ?? 0);
+
+      return res.json({
+        walletAddress,
+        campaignId: String(campaign.id),
+        referralCount,
+        referralBonusPoints: campaign.referralBonusPoints ?? 0,
+        bonusEarned,
+      });
+    });
   }
 
   registerApiRoutes(API_V1_PREFIX);

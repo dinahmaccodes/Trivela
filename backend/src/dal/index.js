@@ -4,12 +4,15 @@ import { assertCampaignRepository } from './campaignRepository.js';
 import { createSqliteCampaignRepository } from './sqliteCampaignRepository.js';
 import { assertAuditLogRepository } from './auditLogRepository.js';
 import { createSqliteAuditLogRepository } from './sqliteAuditLogRepository.js';
+import { WebhookRepository } from './webhookRepository.js';
+import { createSqliteReferralRepository } from './sqliteReferralRepository.js';
 
 export async function createDal({
   dbPath = ':memory:',
   campaigns = [],
   campaignRepository,
   auditLogRepository,
+  webhookRepository,
 } = {}) {
   const db = new Database(dbPath);
 
@@ -27,5 +30,7 @@ export async function createDal({
     auditLogs: assertAuditLogRepository(
       auditLogRepository ?? createSqliteAuditLogRepository({ db }),
     ),
+    webhooks: webhookRepository ?? new WebhookRepository(db),
+    referrals: createSqliteReferralRepository({ db }),
   };
 }
